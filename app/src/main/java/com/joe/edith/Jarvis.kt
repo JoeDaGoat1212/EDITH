@@ -15,6 +15,7 @@ object Prefs {
     const val CODE = "code"              // the phone code JARVIS shows (data/phone_code.txt)
     const val THRESHOLD = "threshold"    // wake word sensitivity, 0.3 - 0.8
     const val GLASSES = "glasses"        // use the Bluetooth glasses' mic + speaker
+    const val ONLY_GLASSES = "only_glasses" // sleep while the glasses are off (folded)
     const val STATUS = "status"          // written by the service, shown in the app
     const val RUNNING = "running"
 

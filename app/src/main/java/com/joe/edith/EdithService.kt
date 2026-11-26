@@ -10,6 +10,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.media.AudioAttributes
+import android.media.AudioDeviceCallback
 import android.media.AudioDeviceInfo
 import android.media.AudioFormat
 import android.media.AudioManager
@@ -37,6 +38,7 @@ import java.util.concurrent.Executors
 class EdithService : Service() {
     companion object {
         const val ACTION_STOP = "com.joe.edith.STOP"
+        private val GLASSES_TOKEN = Any()
         private const val CHANNEL = "edith"
         private const val NOTE_ID = 7
         private const val RATE = 16000
@@ -56,7 +58,12 @@ class EdithService : Service() {
     @Volatile private var listening = false      // true = the wake word loop owns the mic
     private var loop: Thread? = null
     private var followUps = 0
-    private var useGlasses = true
+    private var useGlasses = true                 // the app setting: use the glasses when they're on
+    private var onlyGlasses = true                // the app setting: sleep while the glasses are off
+    @Volatile private var glassesOn = false       // glasses are connected right now
+    @Volatile private var sleeping = false        // glasses are off, so EDITH isn't listening
+    @Volatile private var restartMic = false      // the mic changed: reopen it
+    private var deviceWatch: AudioDeviceCallback? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -91,13 +98,22 @@ class EdithService : Service() {
         val p = Prefs.get(this)
         p.edit().putBoolean(Prefs.RUNNING, true).apply()
         useGlasses = p.getBoolean(Prefs.GLASSES, true)
+        onlyGlasses = useGlasses && p.getBoolean(Prefs.ONLY_GLASSES, true)
         wakeLock = (getSystemService(Context.POWER_SERVICE) as PowerManager)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "edith:listen").apply { acquire() }
         tone = try { ToneGenerator(AudioManager.STREAM_VOICE_CALL, 80) } catch (_: Exception) { null }
         tts = TextToSpeech(this) { ok ->
             if (ok == TextToSpeech.SUCCESS) main.post { setUpVoice() }
         }
-        if (useGlasses) routeToGlasses(true)
+        if (useGlasses) {
+            // put the glasses on = EDITH wakes up, fold them = EDITH sleeps
+            deviceWatch = object : AudioDeviceCallback() {
+                override fun onAudioDevicesAdded(added: Array<out AudioDeviceInfo>?) { checkGlassesSoon() }
+                override fun onAudioDevicesRemoved(removed: Array<out AudioDeviceInfo>?) { checkGlassesSoon() }
+            }
+            audio.registerAudioDeviceCallback(deviceWatch, main)
+        }
+        checkGlasses(announce = false)
         net.execute {
             try {
                 val dir = Jarvis.ensureModels(this, Prefs.server(p), p.getString(Prefs.CODE, "")!!, ::status)
@@ -112,6 +128,8 @@ class EdithService : Service() {
     private fun stopEverything() {
         running = false
         listening = false
+        deviceWatch?.let { audio.unregisterAudioDeviceCallback(it) }
+        deviceWatch = null
         loop?.interrupt()
         loop = null
         recognizer?.destroy(); recognizer = null
@@ -147,16 +165,55 @@ class EdithService : Service() {
         }
     }
 
-    private fun glassesConnected(): Boolean =
-        Build.VERSION.SDK_INT >= 31 && audio.communicationDevice?.let {
-            it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
-        } == true
+    private fun glassesConnected(): Boolean = glassesOn
+
+    /** Is a Bluetooth headset (the glasses) connected with its mic? */
+    private fun findGlasses(): Boolean {
+        val isBt = { d: AudioDeviceInfo -> d.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO || d.type == AudioDeviceInfo.TYPE_BLE_HEADSET }
+        return if (Build.VERSION.SDK_INT >= 31) audio.availableCommunicationDevices.any(isBt)
+               else audio.getDevices(AudioManager.GET_DEVICES_INPUTS).any(isBt)
+    }
+
+    private fun checkGlassesSoon() {
+        // Bluetooth takes a moment to finish connecting the mic: look now and again shortly
+        main.removeCallbacksAndMessages(GLASSES_TOKEN)
+        main.postAtTime({ checkGlasses(announce = true) }, GLASSES_TOKEN, android.os.SystemClock.uptimeMillis() + 300)
+        main.postAtTime({ checkGlasses(announce = true) }, GLASSES_TOKEN, android.os.SystemClock.uptimeMillis() + 2000)
+    }
+
+    private fun checkGlasses(announce: Boolean) {
+        if (!running) return
+        val now = useGlasses && findGlasses()
+        if (now == glassesOn) {                            // nothing changed
+            if (!now && onlyGlasses && !sleeping) goToSleep()
+            return
+        }
+        glassesOn = now
+        if (now) {
+            routeToGlasses(true)
+            sleeping = false
+            restartMic = true
+            tts?.let { setUpVoice() }                      // send the voice to the glasses
+            if (announce) say("EDITH online.") { backToWaiting() } else backToWaiting()
+        } else {
+            routeToGlasses(false)
+            restartMic = true
+            tts?.let { setUpVoice() }
+            if (onlyGlasses) goToSleep() else backToWaiting()
+        }
+    }
+
+    private fun goToSleep() {
+        sleeping = true
+        recognizer?.cancel()
+        status("Sleeping: put your glasses on to wake EDITH")
+    }
 
     // ---------------------------------------------------------------- wake word loop
     @SuppressLint("MissingPermission")
     private fun startWakeLoop(ww: WakeWord) {
         listening = true
-        status(if (glassesConnected()) "Listening through your glasses for \"Hey Jarvis\"" else "Listening for \"Hey Jarvis\"")
+        if (sleeping) goToSleep() else status(if (glassesConnected()) "Listening through your glasses for \"Hey Jarvis\"" else "Listening for \"Hey Jarvis\"")
         loop = Thread {
             val threshold = Prefs.get(this).getFloat(Prefs.THRESHOLD, 0.5f)
             val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
@@ -164,14 +221,19 @@ class EdithService : Service() {
             var rec: AudioRecord? = null
             try {
                 while (running) {
-                    if (!listening) {                              // someone else (speech/voice) has the mic
+                    if (restartMic) {                              // glasses came or went: reopen the mic
+                        restartMic = false
+                        rec?.let { try { it.stop() } catch (_: Exception) {}; it.release() }
+                        rec = null
+                    }
+                    if (!listening || sleeping) {                  // busy (speech/voice) or glasses are off
                         rec?.let { it.stop(); it.release() }
                         rec = null
                         Thread.sleep(100)
                         continue
                     }
                     if (rec == null) {
-                        val src = if (useGlasses) MediaRecorder.AudioSource.VOICE_COMMUNICATION
+                        val src = if (glassesOn) MediaRecorder.AudioSource.VOICE_COMMUNICATION
                                   else MediaRecorder.AudioSource.VOICE_RECOGNITION
                         val fresh = AudioRecord(src, RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
                             maxOf(min, WakeWord.CHUNK * 4))
@@ -186,7 +248,7 @@ class EdithService : Service() {
                     }
                     val r = rec ?: continue
                     var got = 0
-                    while (got < WakeWord.CHUNK && listening && running) {
+                    while (got < WakeWord.CHUNK && listening && running && !sleeping && !restartMic) {
                         val n = r.read(chunk, got, WakeWord.CHUNK - got)
                         if (n <= 0) break
                         got += n
@@ -210,13 +272,14 @@ class EdithService : Service() {
 
     private fun backToWaiting() {
         if (!running) return
+        if (sleeping) { listening = true; goToSleep(); return }
         status(if (glassesConnected()) "Listening through your glasses for \"Hey Jarvis\"" else "Listening for \"Hey Jarvis\"")
         listening = true
     }
 
     // ---------------------------------------------------------------- your request
     private fun heard() {
-        if (!running) return
+        if (!running || sleeping) { listening = true; return }
         tone?.startTone(ToneGenerator.TONE_PROP_BEEP2, 150)
         main.postDelayed({ listenForRequest() }, 250)
     }
@@ -288,8 +351,8 @@ class EdithService : Service() {
         if (pick != null) t.voice = pick
         t.setSpeechRate(1.05f)
         t.setPitch(0.95f)
-        if (useGlasses) t.setAudioAttributes(AudioAttributes.Builder()
-            .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+        t.setAudioAttributes(AudioAttributes.Builder()
+            .setUsage(if (glassesOn) AudioAttributes.USAGE_VOICE_COMMUNICATION else AudioAttributes.USAGE_ASSISTANT)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
         ttsReady = true
     }

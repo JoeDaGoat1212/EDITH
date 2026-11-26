@@ -31,6 +31,7 @@ class MainActivity : Activity(), SharedPreferences.OnSharedPreferenceChangeListe
     private lateinit var server: EditText
     private lateinit var code: EditText
     private lateinit var glasses: Switch
+    private lateinit var onlyGlasses: Switch
     private lateinit var sens: SeekBar
     private lateinit var sensLabel: TextView
     private lateinit var status: TextView
@@ -91,6 +92,12 @@ class MainActivity : Activity(), SharedPreferences.OnSharedPreferenceChangeListe
             setPadding(0, dp(16), 0, dp(8))
         }
         col.addView(glasses)
+        onlyGlasses = Switch(this).apply {
+            text = "Only listen while my glasses are on (fold them = EDITH sleeps)"
+            setTextColor(Color.WHITE)
+            setPadding(0, dp(8), 0, dp(8))
+        }
+        col.addView(onlyGlasses)
 
         sensLabel = label("")
         col.addView(sensLabel)
@@ -158,6 +165,7 @@ class MainActivity : Activity(), SharedPreferences.OnSharedPreferenceChangeListe
         server.setText(prefs.getString(Prefs.SERVER, ""))
         code.setText(prefs.getString(Prefs.CODE, ""))
         glasses.isChecked = prefs.getBoolean(Prefs.GLASSES, true)
+        onlyGlasses.isChecked = prefs.getBoolean(Prefs.ONLY_GLASSES, true)
         sens.progress = ((prefs.getFloat(Prefs.THRESHOLD, 0.5f) - 0.30f) * 100).toInt().coerceIn(0, 50)
         showSens()
     }
@@ -167,6 +175,7 @@ class MainActivity : Activity(), SharedPreferences.OnSharedPreferenceChangeListe
             .putString(Prefs.SERVER, server.text.toString().trim())
             .putString(Prefs.CODE, code.text.toString().trim())
             .putBoolean(Prefs.GLASSES, glasses.isChecked)
+            .putBoolean(Prefs.ONLY_GLASSES, onlyGlasses.isChecked)
             .putFloat(Prefs.THRESHOLD, 0.30f + sens.progress / 100f)
             .apply()
     }
