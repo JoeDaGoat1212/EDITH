@@ -4,6 +4,9 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -26,3 +29,10 @@ jobs:
         with:
           name: EDITH-app
           path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Publish a phone download link
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk EDITH.apk
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest EDITH.apk --title "EDITH (latest)" --notes "Open EDITH.apk on your Android phone to install it."
